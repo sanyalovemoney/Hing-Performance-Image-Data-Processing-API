@@ -5,6 +5,7 @@ using ImageProcessing.Core.Queue;
 using ImageProcessing.Core.Storage;
 using ImageProcessing.Processing.Csv;
 using ImageProcessing.Processing.Images;
+using ImageProcessing.Processing.Matrix;
 using ImageProcessing.Workers;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -25,6 +26,7 @@ builder.Services.AddSingleton(sp =>
     var registry = new ProcessorRegistry();
     registry.Register(new ImageProcessor(storage));
     registry.Register(new CsvProcessor(storage));
+    registry.Register(new MatrixProcessor(storage));
     registry.RegisterFallback(new EchoProcessor(storage));
     return registry;
 });
