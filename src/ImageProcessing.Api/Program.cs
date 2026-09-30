@@ -3,6 +3,7 @@ using ImageProcessing.Core.Jobs;
 using ImageProcessing.Core.Processing;
 using ImageProcessing.Core.Queue;
 using ImageProcessing.Core.Storage;
+using ImageProcessing.Processing.Csv;
 using ImageProcessing.Processing.Images;
 using ImageProcessing.Workers;
 
@@ -23,6 +24,7 @@ builder.Services.AddSingleton(sp =>
     var storage = sp.GetRequiredService<IFileStorage>();
     var registry = new ProcessorRegistry();
     registry.Register(new ImageProcessor(storage));
+    registry.Register(new CsvProcessor(storage));
     registry.RegisterFallback(new EchoProcessor(storage));
     return registry;
 });

@@ -3,6 +3,7 @@ using ImageProcessing.Api.Upload;
 using ImageProcessing.Core.Jobs;
 using ImageProcessing.Core.Queue;
 using ImageProcessing.Core.Storage;
+using ImageProcessing.Processing.Csv;
 
 namespace ImageProcessing.Api.Endpoints;
 
@@ -46,7 +47,83 @@ public static class JobsEndpoints
             .ProducesProblem(StatusCodes.Status404NotFound)
             .ProducesProblem(StatusCodes.Status409Conflict);
 
+        jobs.MapGet("/{id:guid}/rows", StreamRowsAsync)
+            .WithName("StreamJobRows")
+            .Produces(StatusCodes.Status200OK, contentType: "application/x-ndjson")
+            .ProducesProblem(StatusCodes.Status404NotFound)
+            .ProducesProblem(StatusCodes.Status409Conflict);
+
         return app;
+    }
+
+    /// <summary>
+    /// Streams the job's upload as NDJSON — one {"index":n,"fields":[...]} object
+    /// per CSV line — parsing through pooled buffers and flushing to the response
+    /// PipeWriter incrementally. Honors client disconnects via RequestAborted.
+    /// </summary>
+    private static async Task StreamRowsAsync(
+        Guid id,
+        IJobStore store,
+        IFileStorage storage,
+        HttpContext http,
+        CancellationToken ct)
+    {
+        var job = store.Get(id);
+        if (job is null)
+        {
+            http.Response.StatusCode = StatusCodes.Status404NotFound;
+            await http.Response.WriteAsJsonAsync(new { error = "job not found" }, ct);
+            return;
+        }
+
+        if (job.Type != "csv" || job.UploadPath is null || !storage.Exists(job.UploadPath))
+        {
+            http.Response.StatusCode = StatusCodes.Status409Conflict;
+            await http.Response.WriteAsJsonAsync(
+                new { error = "row streaming requires a csv job with an available upload" }, ct);
+            return;
+        }
+
+        http.Response.ContentType = "application/x-ndjson";
+        var writer = http.Response.BodyWriter;
+
+        await using var upload = storage.OpenRead(job.UploadPath);
+        await using var json = new Utf8JsonWriter(writer);
+        var buffered = 0L;
+
+        await foreach (var row in CsvLineReader.ReadRowsAsync(upload, ct: ct))
+        {
+            json.WriteStartObject();
+            json.WriteNumber("index", row.Index);
+            json.WriteStartArray("fields");
+            foreach (var field in row.Fields)
+            {
+                json.WriteStringValue(field);
+            }
+
+            json.WriteEndArray();
+            json.WriteEndObject();
+
+            // NDJSON: commit the object into the pipe, append the record
+            // separator straight into the pipe buffer, then reset the writer
+            // so every line is a fresh root document.
+            buffered += json.BytesPending + 1;
+            await json.FlushAsync(ct);
+            var newline = writer.GetMemory(1);
+            newline.Span[0] = (byte)'\n';
+            writer.Advance(1);
+            json.Reset();
+
+            // FlushAsync awaits when the pipe hits its pause threshold —
+            // that is the backpressure point for slow clients.
+            if (buffered > 16 * 1024)
+            {
+                await writer.FlushAsync(ct);
+                buffered = 0;
+            }
+        }
+
+        await writer.FlushAsync(ct);
     }
 
     /// <summary>
