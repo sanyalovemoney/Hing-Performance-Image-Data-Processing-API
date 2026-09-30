@@ -1,17 +1,16 @@
 using System.Text.Json;
 using ImageProcessing.Api.Upload;
+using ImageProcessing.Core.Configuration;
 using ImageProcessing.Core.Jobs;
 using ImageProcessing.Core.Queue;
 using ImageProcessing.Core.Storage;
 using ImageProcessing.Processing.Csv;
+using Microsoft.Extensions.Options;
 
 namespace ImageProcessing.Api.Endpoints;
 
 public static class JobsEndpoints
 {
-    // Provisional cap until ProcessingOptions land (Limits phase).
-    internal const long UploadCapBytes = 50L * 1024 * 1024;
-
     private static readonly HashSet<string> AllowedTypes = new(StringComparer.OrdinalIgnoreCase)
     {
         "image", "csv", "matrix", "echo",
@@ -158,26 +157,34 @@ public static class JobsEndpoints
         IJobStore store,
         IJobQueue queue,
         IFileStorage storage,
+        IOptions<ProcessingOptions> options,
         CancellationToken ct)
     {
         var id = Guid.NewGuid();
         var partPath = storage.CreateUploadPath(id, ".part");
 
-        MultipartStreamReader.UploadResult? uploaded;
+        MultipartStreamReader.UploadResult? uploaded = null;
+        PayloadTooLargeException? tooLarge = null;
         await using (var upload = storage.OpenWrite(partPath))
         {
             try
             {
-                uploaded = await MultipartStreamReader.ReadAsync(request, upload, UploadCapBytes, ct);
+                uploaded = await MultipartStreamReader.ReadAsync(
+                    request, upload, options.Value.MaxUploadBytes, ct);
             }
             catch (PayloadTooLargeException ex)
             {
-                storage.Delete(partPath);
-                return Results.Problem(
-                    statusCode: StatusCodes.Status413PayloadTooLarge,
-                    title: "Payload too large",
-                    detail: ex.Message);
+                tooLarge = ex; // delete must wait until the stream is disposed (FileShare.None)
             }
+        }
+
+        if (tooLarge is not null)
+        {
+            storage.Delete(partPath);
+            return Results.Problem(
+                statusCode: StatusCodes.Status413PayloadTooLarge,
+                title: "Payload too large",
+                detail: tooLarge.Message);
         }
 
         if (uploaded is null)
