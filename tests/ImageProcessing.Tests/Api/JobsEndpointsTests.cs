@@ -228,6 +228,51 @@ public sealed class JobsEndpointsTests : IClassFixture<JobsApiFactory>
     }
 
     [Fact]
+    public async Task Matrix_job_produces_binary_result()
+    {
+        using var client = _factory.CreateClient();
+        var payload = Processing.MatrixTestHelpers.BuildBinary(2, 3, new float[] { 1, 2, 3, 4, 5, 6 });
+        using var form = MakeForm(
+            type: "matrix", fileName: "m.bin", payload: payload, mediaType: "application/octet-stream");
+        form.Add(new StringContent("""{"op":"scale","scale":3}"""), "params");
+
+        var response = await client.PostAsync("/api/v1/jobs", form);
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        var created = await response.Content.ReadFromJsonAsync<JobStatusDto>(JsonOpts);
+
+        var dto = await PollUntilTerminalAsync(client, $"/api/v1/jobs/{created!.Id}/status");
+        Assert.Equal("Succeeded", dto.Status);
+
+        var result = await client.GetAsync($"/api/v1/jobs/{created.Id}/result");
+        Assert.Equal(HttpStatusCode.OK, result.StatusCode);
+        Assert.Equal("application/octet-stream", result.Content.Headers.ContentType?.MediaType);
+
+        var (rows, cols, data) = Processing.MatrixTestHelpers.ParseBinary(
+            await result.Content.ReadAsByteArrayAsync());
+        Assert.Equal(2, rows);
+        Assert.Equal(3, cols);
+        Assert.Equal(new float[] { 3, 6, 9, 12, 15, 18 }, data);
+    }
+
+    [Fact]
+    public async Task Malformed_matrix_upload_fails_with_readable_error()
+    {
+        using var client = _factory.CreateClient();
+        using var form = MakeForm(
+            type: "matrix",
+            fileName: "m.bin",
+            payload: new byte[] { 9, 0, 0, 0, 9, 0, 0, 0 }, // claims 9x9, has no data
+            mediaType: "application/octet-stream");
+
+        var response = await client.PostAsync("/api/v1/jobs", form);
+        var created = await response.Content.ReadFromJsonAsync<JobStatusDto>(JsonOpts);
+
+        var dto = await PollUntilTerminalAsync(client, $"/api/v1/jobs/{created!.Id}/status");
+        Assert.Equal("Failed", dto.Status);
+        Assert.Contains("truncated", dto.Error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task Rows_for_unknown_job_returns_404()
     {
         using var client = _factory.CreateClient();
