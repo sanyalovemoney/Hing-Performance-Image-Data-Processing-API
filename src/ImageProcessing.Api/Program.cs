@@ -3,6 +3,7 @@ using ImageProcessing.Core.Jobs;
 using ImageProcessing.Core.Processing;
 using ImageProcessing.Core.Queue;
 using ImageProcessing.Core.Storage;
+using ImageProcessing.Processing.Images;
 using ImageProcessing.Workers;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -19,8 +20,10 @@ builder.Services.AddSingleton<IJobQueue>(_ => new ChannelJobQueue(capacity: 128)
 builder.Services.AddSingleton<IFileStorage>(_ => new TempFileStorage(storageRoot));
 builder.Services.AddSingleton(sp =>
 {
+    var storage = sp.GetRequiredService<IFileStorage>();
     var registry = new ProcessorRegistry();
-    registry.RegisterFallback(new EchoProcessor(sp.GetRequiredService<IFileStorage>()));
+    registry.Register(new ImageProcessor(storage));
+    registry.RegisterFallback(new EchoProcessor(storage));
     return registry;
 });
 builder.Services.AddJobWorkers();

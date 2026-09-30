@@ -40,7 +40,40 @@ public static class JobsEndpoints
             .Produces<JobStatusDto>()
             .ProducesProblem(StatusCodes.Status404NotFound);
 
+        jobs.MapGet("/{id:guid}/result", GetResultAsync)
+            .WithName("GetJobResult")
+            .Produces(StatusCodes.Status200OK, contentType: "application/octet-stream")
+            .ProducesProblem(StatusCodes.Status404NotFound)
+            .ProducesProblem(StatusCodes.Status409Conflict);
+
         return app;
+    }
+
+    /// <summary>
+    /// Streams the result file straight from disk — the payload never lands in
+    /// a byte[] on the server. 409 while the job is not Succeeded yet.
+    /// </summary>
+    private static IResult GetResultAsync(Guid id, IJobStore store, IFileStorage storage)
+    {
+        var job = store.Get(id);
+        if (job is null)
+        {
+            return Results.NotFound();
+        }
+
+        if (job.Status != JobStatus.Succeeded || job.ResultPath is null)
+        {
+            return Results.Conflict(new { error = "result is not available yet", status = job.Status.ToString() });
+        }
+
+        if (!storage.Exists(job.ResultPath))
+        {
+            return Results.Conflict(new { error = "result file is missing (expired?)", status = job.Status.ToString() });
+        }
+
+        var stream = storage.OpenRead(job.ResultPath);
+        var downloadName = $"{id:N}{Path.GetExtension(job.ResultPath)}";
+        return Results.File(stream, job.ResultContentType ?? "application/octet-stream", downloadName);
     }
 
     private static async Task<IResult> UploadAsync(
