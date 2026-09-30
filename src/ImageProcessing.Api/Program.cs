@@ -1,6 +1,7 @@
 var builder = WebApplication.CreateBuilder(args);
 var app = builder.Build();
 
-app.MapGet("/", () => "Hello World!");
+// Liveness probe — always OK once the process is up.
+app.MapGet("/healthz", () => Results.Ok(new { status = "ok" }));
 
 app.Run();
