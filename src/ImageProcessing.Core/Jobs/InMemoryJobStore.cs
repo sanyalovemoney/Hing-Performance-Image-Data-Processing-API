@@ -42,4 +42,18 @@ public sealed class InMemoryJobStore : IJobStore
     }
 
     public bool TryRemove(Guid id) => _jobs.TryRemove(id, out _);
+
+    public IReadOnlyList<JobRecord> List()
+    {
+        var all = new List<JobRecord>(_jobs.Count);
+        foreach (var job in _jobs.Values)
+        {
+            lock (job)
+            {
+                all.Add(job.Snapshot());
+            }
+        }
+
+        return all;
+    }
 }

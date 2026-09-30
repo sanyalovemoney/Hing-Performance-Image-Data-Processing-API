@@ -16,4 +16,7 @@ public interface IJobStore
 
     /// <summary>Removes the record (used by TTL cleanup).</summary>
     bool TryRemove(Guid id);
+
+    /// <summary>Snapshot of every record (used by TTL cleanup and diagnostics).</summary>
+    IReadOnlyList<JobRecord> List();
 }
