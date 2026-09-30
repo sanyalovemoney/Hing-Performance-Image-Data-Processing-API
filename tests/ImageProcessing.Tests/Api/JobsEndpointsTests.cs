@@ -1,6 +1,8 @@
+using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
+using System.Text;
 using System.Text.Json;
 using ImageProcessing.Api.Endpoints;
 
@@ -17,11 +19,15 @@ public sealed class JobsEndpointsTests : IClassFixture<JobsApiFactory>
     private static byte[] TinyPng() => Convert.FromBase64String(
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==");
 
-    private static MultipartFormDataContent MakeForm(string? type = "echo", string fileName = "pixel.png")
+    private static MultipartFormDataContent MakeForm(
+        string? type = "echo",
+        string fileName = "pixel.png",
+        byte[]? payload = null,
+        string mediaType = "image/png")
     {
         var form = new MultipartFormDataContent();
-        var content = new ByteArrayContent(TinyPng());
-        content.Headers.ContentType = new MediaTypeHeaderValue("image/png");
+        var content = new ByteArrayContent(payload ?? TinyPng());
+        content.Headers.ContentType = new MediaTypeHeaderValue(mediaType);
         form.Add(content, "file", fileName);
         if (type is not null)
         {
@@ -29,6 +35,19 @@ public sealed class JobsEndpointsTests : IClassFixture<JobsApiFactory>
         }
 
         return form;
+    }
+
+    /// <summary>Header + 20 rows: id=i, value=i*0.5 → sum(value) = 105.</summary>
+    private static byte[] BuildCsvPayload()
+    {
+        var builder = new StringBuilder("id,value\n");
+        for (var i = 1; i <= 20; i++)
+        {
+            builder.Append(i.ToString(CultureInfo.InvariantCulture)).Append(',')
+                .Append((i * 0.5).ToString(CultureInfo.InvariantCulture)).Append('\n');
+        }
+
+        return Encoding.UTF8.GetBytes(builder.ToString());
     }
 
     [Fact]
@@ -138,6 +157,98 @@ public sealed class JobsEndpointsTests : IClassFixture<JobsApiFactory>
         var response = await client.GetAsync($"/api/v1/jobs/{Guid.NewGuid()}/result");
 
         Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Csv_job_produces_json_aggregate()
+    {
+        using var client = _factory.CreateClient();
+        using var form = MakeForm(type: "csv", fileName: "data.csv", payload: BuildCsvPayload(), mediaType: "text/csv");
+        form.Add(new StringContent("""{"column":1,"aggregate":"sum"}"""), "params");
+
+        var response = await client.PostAsync("/api/v1/jobs", form);
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+
+        var created = await response.Content.ReadFromJsonAsync<JobStatusDto>(JsonOpts);
+        Assert.NotNull(created);
+
+        var dto = await PollUntilTerminalAsync(client, $"/api/v1/jobs/{created!.Id}/status");
+        Assert.Equal("Succeeded", dto.Status);
+
+        var result = await client.GetAsync($"/api/v1/jobs/{created.Id}/result");
+        Assert.Equal(HttpStatusCode.OK, result.StatusCode);
+        Assert.Equal("application/json", result.Content.Headers.ContentType?.MediaType);
+
+        using var json = JsonDocument.Parse(await result.Content.ReadAsStringAsync());
+        Assert.Equal(20, json.RootElement.GetProperty("rows").GetInt64());
+        Assert.Equal(105, json.RootElement.GetProperty("value").GetDouble(), 6);
+    }
+
+    [Fact]
+    public async Task Csv_job_with_bad_aggregate_fails_with_readable_error()
+    {
+        using var client = _factory.CreateClient();
+        using var form = MakeForm(type: "csv", fileName: "data.csv", payload: BuildCsvPayload(), mediaType: "text/csv");
+        form.Add(new StringContent("""{"column":1,"aggregate":"median"}"""), "params");
+
+        var response = await client.PostAsync("/api/v1/jobs", form);
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        var created = await response.Content.ReadFromJsonAsync<JobStatusDto>(JsonOpts);
+
+        var dto = await PollUntilTerminalAsync(client, $"/api/v1/jobs/{created!.Id}/status");
+        Assert.Equal("Failed", dto.Status);
+        Assert.Contains("aggregate", dto.Error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Rows_endpoint_streams_ndjson()
+    {
+        using var client = _factory.CreateClient();
+        using var form = MakeForm(type: "csv", fileName: "data.csv", payload: BuildCsvPayload(), mediaType: "text/csv");
+
+        var response = await client.PostAsync("/api/v1/jobs", form);
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        var created = await response.Content.ReadFromJsonAsync<JobStatusDto>(JsonOpts);
+
+        var rows = await client.GetAsync($"/api/v1/jobs/{created!.Id}/rows");
+        Assert.Equal(HttpStatusCode.OK, rows.StatusCode);
+        Assert.Equal("application/x-ndjson", rows.Content.Headers.ContentType?.MediaType);
+
+        var body = await rows.Content.ReadAsStringAsync();
+        var lines = body.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        Assert.Equal(21, lines.Length); // header + 20 data rows
+
+        using var first = JsonDocument.Parse(lines[0]);
+        Assert.Equal(0, first.RootElement.GetProperty("index").GetInt32());
+        Assert.Equal("id", first.RootElement.GetProperty("fields")[0].GetString());
+
+        using var last = JsonDocument.Parse(lines[^1]);
+        Assert.Equal(20, last.RootElement.GetProperty("index").GetInt32());
+        Assert.Equal("10", last.RootElement.GetProperty("fields")[1].GetString());
+    }
+
+    [Fact]
+    public async Task Rows_for_unknown_job_returns_404()
+    {
+        using var client = _factory.CreateClient();
+
+        var response = await client.GetAsync($"/api/v1/jobs/{Guid.NewGuid()}/rows");
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Rows_for_non_csv_job_returns_409()
+    {
+        using var client = _factory.CreateClient();
+        using var form = MakeForm(type: "image");
+
+        var response = await client.PostAsync("/api/v1/jobs", form);
+        var created = await response.Content.ReadFromJsonAsync<JobStatusDto>(JsonOpts);
+
+        var rows = await client.GetAsync($"/api/v1/jobs/{created!.Id}/rows");
+
+        Assert.Equal(HttpStatusCode.Conflict, rows.StatusCode);
     }
 
     private static async Task<JobStatusDto> PollUntilTerminalAsync(HttpClient client, string statusUrl)
