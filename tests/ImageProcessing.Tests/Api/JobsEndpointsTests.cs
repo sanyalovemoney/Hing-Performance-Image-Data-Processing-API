@@ -103,6 +103,43 @@ public sealed class JobsEndpointsTests : IClassFixture<JobsApiFactory>
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
     }
 
+    [Fact]
+    public async Task Image_job_produces_png_result()
+    {
+        using var client = _factory.CreateClient();
+        using var form = MakeForm(type: "image");
+        form.Add(new StringContent("""{"filter":"grayscale"}"""), "params");
+
+        var response = await client.PostAsync("/api/v1/jobs", form);
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+
+        var created = await response.Content.ReadFromJsonAsync<JobStatusDto>(JsonOpts);
+        Assert.NotNull(created);
+
+        var dto = await PollUntilTerminalAsync(client, $"/api/v1/jobs/{created!.Id}/status");
+        Assert.Equal("Succeeded", dto.Status);
+
+        var result = await client.GetAsync($"/api/v1/jobs/{created.Id}/result");
+        Assert.Equal(HttpStatusCode.OK, result.StatusCode);
+        Assert.Equal("image/png", result.Content.Headers.ContentType?.MediaType);
+
+        var bytes = await result.Content.ReadAsByteArrayAsync();
+        using var decoded = SixLabors.ImageSharp.Image.Load<SixLabors.ImageSharp.PixelFormats.Bgra32>(
+            new MemoryStream(bytes));
+        Assert.Equal(1, decoded.Width);
+        Assert.Equal(1, decoded.Height);
+    }
+
+    [Fact]
+    public async Task Result_for_unknown_job_returns_404()
+    {
+        using var client = _factory.CreateClient();
+
+        var response = await client.GetAsync($"/api/v1/jobs/{Guid.NewGuid()}/result");
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
     private static async Task<JobStatusDto> PollUntilTerminalAsync(HttpClient client, string statusUrl)
     {
         var deadline = DateTime.UtcNow.AddSeconds(15);
