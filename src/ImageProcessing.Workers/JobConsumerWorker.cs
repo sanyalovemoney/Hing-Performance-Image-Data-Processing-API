@@ -1,54 +1,116 @@
+using ImageProcessing.Core.Configuration;
 using ImageProcessing.Core.Jobs;
 using ImageProcessing.Core.Processing;
 using ImageProcessing.Core.Queue;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 namespace ImageProcessing.Workers;
 
 /// <summary>
-/// Consumes the job queue for the lifetime of the host.
-/// Phase 1 processes leases sequentially; bounded concurrency via SemaphoreSlim
-/// and graceful drain land in the Limits phase.
+/// Consumes the job queue for the lifetime of the host:
+///  - up to <see cref="ProcessingOptions.MaxConcurrency"/> jobs run at once (SemaphoreSlim gate);
+///  - every job gets a <see cref="ProcessingOptions.JobTimeout"/> budget, enforced by its own CTS;
+///  - a single IOException gets one retry after a short pause (transient disk hiccups);
+///  - on shutdown the queue is completed and in-flight jobs drain within
+///    <see cref="ProcessingOptions.ShutdownDrainTimeout"/> instead of being canceled outright.
 /// </summary>
 public sealed class JobConsumerWorker : BackgroundService
 {
+    private static readonly TimeSpan RetryDelay = TimeSpan.FromMilliseconds(250);
+
     private readonly IJobQueue _queue;
     private readonly IJobStore _store;
     private readonly ProcessorRegistry _registry;
+    private readonly ProcessingOptions _options;
     private readonly ILogger<JobConsumerWorker> _log;
 
     public JobConsumerWorker(
         IJobQueue queue,
         IJobStore store,
         ProcessorRegistry registry,
+        IOptions<ProcessingOptions> options,
         ILogger<JobConsumerWorker> log)
     {
         _queue = queue;
         _store = store;
         _registry = registry;
+        _options = options.Value;
         _log = log;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _log.LogInformation("job consumer started (queue capacity {Capacity})", _queue.Capacity);
-        try
+        // Completing the writer side makes ReadAllAsync finish after draining,
+        // whether shutdown came through StopAsync or the token fired first.
+        using var completion = stoppingToken.Register(_queue.Complete);
+
+        // No `using`: an abandoned job (drain timeout) may still touch the gate
+        // after ExecuteAsync returns, and Release on a disposed semaphore throws.
+        // SemaphoreSlim only needs disposal when its wait handle is used — never here.
+        var gate = new SemaphoreSlim(_options.MaxConcurrency);
+        var inFlight = new List<Task>();
+
+        _log.LogInformation(
+            "job consumer started (capacity {Capacity}, concurrency {Concurrency}, timeout {Timeout})",
+            _queue.Capacity, _options.MaxConcurrency, _options.JobTimeout);
+
+        await foreach (var lease in _queue.ReadAllAsync(CancellationToken.None).ConfigureAwait(false))
         {
-            await foreach (var lease in _queue.ReadAllAsync(stoppingToken).ConfigureAwait(false))
+            await gate.WaitAsync().ConfigureAwait(false);
+            lock (inFlight)
             {
-                await ExecuteLeaseAsync(lease, stoppingToken).ConfigureAwait(false);
+                inFlight.RemoveAll(t => t.IsCompleted);
+                inFlight.Add(Task.Run(() => RunGatedAsync(gate, lease), CancellationToken.None));
             }
         }
-        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+
+        Task[] pending;
+        lock (inFlight)
         {
-            // Host shutdown: ReadAllAsync canceled — nothing left to do.
+            pending = [.. inFlight];
+        }
+
+        if (pending.Length > 0)
+        {
+            _log.LogInformation("draining {Count} in-flight job(s)", pending.Length);
+            try
+            {
+                await Task.WhenAll(pending)
+                    .WaitAsync(_options.ShutdownDrainTimeout, CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
+            catch (TimeoutException)
+            {
+                _log.LogWarning(
+                    "shutdown drain timed out after {Timeout}; abandoning {Count} job(s)",
+                    _options.ShutdownDrainTimeout, pending.Count(t => !t.IsCompleted));
+            }
         }
 
         _log.LogInformation("job consumer stopped");
     }
 
-    private async Task ExecuteLeaseAsync(JobLease lease, CancellationToken stoppingToken)
+    public override async Task StopAsync(CancellationToken cancellationToken)
+    {
+        _queue.Complete(); // stop accepting; the reader loop drains what is already queued
+        await base.StopAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task RunGatedAsync(SemaphoreSlim gate, JobLease lease)
+    {
+        try
+        {
+            await ExecuteLeaseAsync(lease).ConfigureAwait(false);
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    private async Task ExecuteLeaseAsync(JobLease lease)
     {
         var snapshot = _store.Get(lease.JobId);
         if (snapshot is null || snapshot.Status != JobStatus.Queued)
@@ -73,9 +135,24 @@ public sealed class JobConsumerWorker : BackgroundService
 
         // Processors work on a private copy; only terminal state is written back.
         var working = snapshot with { Status = JobStatus.Running };
+
+        // Deliberately NOT linked to the host stopping token: a job that already
+        // started should finish (or hit its own timeout) during graceful drain.
+        using var timeout = new CancellationTokenSource(_options.JobTimeout);
         try
         {
-            await processor.ProcessAsync(working, stoppingToken).ConfigureAwait(false);
+            try
+            {
+                await processor.ProcessAsync(working, timeout.Token).ConfigureAwait(false);
+            }
+            catch (IOException io) when (!timeout.IsCancellationRequested)
+            {
+                // Transient disk hiccup: one retry after a short pause.
+                _log.LogWarning(io, "job {JobId} hit an I/O error; retrying once", lease.JobId);
+                await Task.Delay(RetryDelay, timeout.Token).ConfigureAwait(false);
+                await processor.ProcessAsync(working, timeout.Token).ConfigureAwait(false);
+            }
+
             _store.Update(lease.JobId, j =>
             {
                 j.Status = JobStatus.Succeeded;
@@ -86,15 +163,10 @@ public sealed class JobConsumerWorker : BackgroundService
             });
             _log.LogInformation("job {JobId} ({Type}) succeeded", lease.JobId, lease.Type);
         }
-        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        catch (OperationCanceledException) when (timeout.IsCancellationRequested)
         {
-            _store.Update(lease.JobId, j =>
-            {
-                j.Status = JobStatus.Canceled;
-                j.Error = "canceled during shutdown";
-                j.FinishedAt = DateTimeOffset.UtcNow;
-            });
-            _log.LogInformation("job {JobId} canceled", lease.JobId);
+            Fail(lease.JobId, $"job timed out after {_options.JobTimeout}");
+            _log.LogWarning("job {JobId} ({Type}) timed out", lease.JobId, lease.Type);
         }
         catch (Exception ex)
         {

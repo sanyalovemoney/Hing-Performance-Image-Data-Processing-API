@@ -8,6 +8,7 @@ public static class WorkerExtensions
     public static IServiceCollection AddJobWorkers(this IServiceCollection services)
     {
         services.AddHostedService<JobConsumerWorker>();
+        services.AddHostedService<TempCleanupWorker>();
         return services;
     }
 }
