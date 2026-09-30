@@ -1,0 +1,14 @@
+**/bin/
+**/obj/
+**/.vs/
+**/.vscode/
+.git/
+.github/
+docs/
+tests/
+bench/
+BenchmarkDotNet.Artifacts/
+storage/
+*.md
+Dockerfile
+.dockerignore
