@@ -5,6 +5,12 @@ using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
 using ImageProcessing.Api.Endpoints;
+using ImageProcessing.Core.Jobs;
+using ImageProcessing.Core.Processing;
+using ImageProcessing.Core.Queue;
+using Microsoft.AspNetCore.TestHost;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 
 namespace ImageProcessing.Tests.Api;
 
@@ -296,6 +302,119 @@ public sealed class JobsEndpointsTests : IClassFixture<JobsApiFactory>
         Assert.Equal(HttpStatusCode.Conflict, rows.StatusCode);
     }
 
+    [Fact]
+    public async Task Readyz_returns_200_when_queue_is_idle()
+    {
+        using var client = _factory.CreateClient();
+
+        var response = await client.GetAsync("/readyz");
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        Assert.Equal("ready", json.RootElement.GetProperty("status").GetString());
+        Assert.True(json.RootElement.GetProperty("capacity").GetInt32() > 0);
+    }
+
+    [Fact]
+    public async Task Upload_over_max_bytes_returns_413()
+    {
+        await using var factory = new JobsApiFactory();
+        using var smallCap = factory.WithWebHostBuilder(b =>
+            b.UseSetting("Processing:MaxUploadBytes", "1024"));
+        using var client = smallCap.CreateClient();
+        using var form = MakeForm(payload: new byte[5000]);
+
+        var response = await client.PostAsync("/api/v1/jobs", form);
+
+        Assert.Equal(HttpStatusCode.RequestEntityTooLarge, response.StatusCode);
+    }
+
+    /// <summary>Parks on a TCS so the test controls exactly when the job finishes.</summary>
+    private sealed class GateProcessor : IJobProcessor
+    {
+        private readonly TaskCompletionSource _gate;
+
+        public GateProcessor(string type, TaskCompletionSource gate)
+        {
+            Type = type;
+            _gate = gate;
+        }
+
+        public string Type { get; }
+
+        public Task ProcessAsync(JobRecord job, CancellationToken ct) => _gate.Task.WaitAsync(ct);
+    }
+
+    [Fact]
+    public async Task Full_queue_returns_503_and_readyz_reports_overload()
+    {
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var factory = new JobsApiFactory();
+        using var gated = factory.WithWebHostBuilder(b =>
+        {
+            // Capacity 4 + single slot: the parked job freezes the consumer, so
+            // fake leases stay queued and the queue is provably full.
+            b.UseSetting("Processing:QueueCapacity", "4");
+            b.UseSetting("Processing:MaxConcurrency", "1");
+            b.ConfigureTestServices(services =>
+            {
+                services.AddSingleton(_ =>
+                    new ProcessorRegistry().Register(new GateProcessor("echo", gate)));
+            });
+        });
+        using var client = gated.CreateClient();
+
+        using var form = MakeForm();
+        var accepted = await client.PostAsync("/api/v1/jobs", form);
+        Assert.Equal(HttpStatusCode.Accepted, accepted.StatusCode);
+        var created = await accepted.Content.ReadFromJsonAsync<JobStatusDto>(JsonOpts);
+        Assert.NotNull(created);
+        await PollUntilRunningAsync(client, created!.Id);
+
+        var queue = gated.Services.GetRequiredService<IJobQueue>();
+
+        // First lease gets picked up by the consumer and parks on the gate
+        // (worker slot taken, so the next one cannot be dequeued).
+        Assert.True(queue.TryEnqueue(new JobLease(Guid.NewGuid(), "echo")));
+        var takenDeadline = DateTime.UtcNow.AddSeconds(10);
+        while (queue.Count > 0 && DateTime.UtcNow < takenDeadline)
+        {
+            await Task.Delay(25);
+        }
+
+        Assert.Equal(0, queue.Count);
+
+        // Fill the bounded queue to capacity.
+        for (var i = 0; i < 4; i++)
+        {
+            Assert.True(queue.TryEnqueue(new JobLease(Guid.NewGuid(), "echo")), $"enqueue {i} rejected");
+        }
+
+        Assert.Equal(4, queue.Count);
+
+        // Upload beyond capacity → 503 with Retry-After.
+        using var overflowForm = MakeForm();
+        var rejected = await client.PostAsync("/api/v1/jobs", overflowForm);
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, rejected.StatusCode);
+        Assert.Equal(TimeSpan.FromSeconds(5), rejected.Headers.RetryAfter?.Delta);
+
+        // /readyz at the high-watermark (ceil(4*0.9)=4) → 503 overloaded.
+        var notReady = await client.GetAsync("/readyz");
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, notReady.StatusCode);
+        using (var body = JsonDocument.Parse(await notReady.Content.ReadAsStringAsync()))
+        {
+            Assert.Equal("overloaded", body.RootElement.GetProperty("status").GetString());
+            Assert.Equal(4, body.RootElement.GetProperty("queued").GetInt32());
+        }
+
+        // Release the gate: the parked job finishes, the fake leases drain
+        // (skipped — no store records) and readiness recovers.
+        gate.SetResult();
+        var done = await PollUntilTerminalAsync(client, $"/api/v1/jobs/{created.Id}/status");
+        Assert.Equal("Succeeded", done.Status);
+        await PollUntilReadyAsync(client);
+    }
+
     private static async Task<JobStatusDto> PollUntilTerminalAsync(HttpClient client, string statusUrl)
     {
         var deadline = DateTime.UtcNow.AddSeconds(15);
@@ -312,5 +431,40 @@ public sealed class JobsEndpointsTests : IClassFixture<JobsApiFactory>
         }
 
         throw new TimeoutException($"job at {statusUrl} did not reach a terminal state");
+    }
+
+    private static async Task PollUntilRunningAsync(HttpClient client, Guid id)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        while (DateTime.UtcNow < deadline)
+        {
+            var dto = await client.GetFromJsonAsync<JobStatusDto>(
+                $"/api/v1/jobs/{id}/status", JsonOpts);
+            if (dto?.Status == "Running")
+            {
+                return;
+            }
+
+            await Task.Delay(50);
+        }
+
+        throw new TimeoutException($"job {id} did not start running");
+    }
+
+    private static async Task PollUntilReadyAsync(HttpClient client)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        while (DateTime.UtcNow < deadline)
+        {
+            var response = await client.GetAsync("/readyz");
+            if (response.StatusCode == HttpStatusCode.OK)
+            {
+                return;
+            }
+
+            await Task.Delay(50);
+        }
+
+        throw new TimeoutException("/readyz did not recover");
     }
 }

@@ -119,9 +119,16 @@ public sealed class CsvLineReaderTests
         // Warm the ArrayPool buckets this size class needs.
         await CsvLineReader.ForEachLineAsync(new MemoryStream(bytes), _ => default);
 
-        var before = GC.GetTotalAllocatedBytes(true);
-        await CsvLineReader.ForEachLineAsync(new MemoryStream(bytes), _ => default);
-        var allocated = GC.GetTotalAllocatedBytes(true) - before;
+        // GC.GetTotalAllocatedBytes(true) counts every thread's allocations, so
+        // a live test host's background work can pollute a single attempt.
+        // A genuine regression fails every attempt — keep the quietest of three.
+        long allocated = long.MaxValue;
+        for (var attempt = 0; attempt < 3 && allocated >= bytes.Length / 4; attempt++)
+        {
+            var before = GC.GetTotalAllocatedBytes(true);
+            await CsvLineReader.ForEachLineAsync(new MemoryStream(bytes), _ => default);
+            allocated = Math.Min(allocated, GC.GetTotalAllocatedBytes(true) - before);
+        }
 
         Assert.True(
             allocated < bytes.Length / 4,
