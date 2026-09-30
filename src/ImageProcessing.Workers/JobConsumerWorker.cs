@@ -23,6 +23,7 @@ public sealed class JobConsumerWorker : BackgroundService
     private readonly IJobQueue _queue;
     private readonly IJobStore _store;
     private readonly ProcessorRegistry _registry;
+    private readonly JobCancellationRegistry _cancellations;
     private readonly ProcessingOptions _options;
     private readonly ILogger<JobConsumerWorker> _log;
 
@@ -30,12 +31,14 @@ public sealed class JobConsumerWorker : BackgroundService
         IJobQueue queue,
         IJobStore store,
         ProcessorRegistry registry,
+        JobCancellationRegistry cancellations,
         IOptions<ProcessingOptions> options,
         ILogger<JobConsumerWorker> log)
     {
         _queue = queue;
         _store = store;
         _registry = registry;
+        _cancellations = cancellations;
         _options = options.Value;
         _log = log;
     }
@@ -138,19 +141,24 @@ public sealed class JobConsumerWorker : BackgroundService
 
         // Deliberately NOT linked to the host stopping token: a job that already
         // started should finish (or hit its own timeout) during graceful drain.
+        // The linked token combines the job timeout with client cancellation
+        // (DELETE /api/v1/jobs/{id}).
         using var timeout = new CancellationTokenSource(_options.JobTimeout);
+        var clientCancel = _cancellations.Register(lease.JobId);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(
+            timeout.Token, clientCancel.Token);
         try
         {
             try
             {
-                await processor.ProcessAsync(working, timeout.Token).ConfigureAwait(false);
+                await processor.ProcessAsync(working, linked.Token).ConfigureAwait(false);
             }
-            catch (IOException io) when (!timeout.IsCancellationRequested)
+            catch (IOException io) when (!linked.IsCancellationRequested)
             {
                 // Transient disk hiccup: one retry after a short pause.
                 _log.LogWarning(io, "job {JobId} hit an I/O error; retrying once", lease.JobId);
-                await Task.Delay(RetryDelay, timeout.Token).ConfigureAwait(false);
-                await processor.ProcessAsync(working, timeout.Token).ConfigureAwait(false);
+                await Task.Delay(RetryDelay, linked.Token).ConfigureAwait(false);
+                await processor.ProcessAsync(working, linked.Token).ConfigureAwait(false);
             }
 
             _store.Update(lease.JobId, j =>
@@ -163,6 +171,16 @@ public sealed class JobConsumerWorker : BackgroundService
             });
             _log.LogInformation("job {JobId} ({Type}) succeeded", lease.JobId, lease.Type);
         }
+        catch (OperationCanceledException) when (clientCancel.IsCancellationRequested)
+        {
+            _store.Update(lease.JobId, j =>
+            {
+                j.Status = JobStatus.Canceled;
+                j.Error = "canceled by client";
+                j.FinishedAt = DateTimeOffset.UtcNow;
+            });
+            _log.LogInformation("job {JobId} ({Type}) canceled by client", lease.JobId, lease.Type);
+        }
         catch (OperationCanceledException) when (timeout.IsCancellationRequested)
         {
             Fail(lease.JobId, $"job timed out after {_options.JobTimeout}");
@@ -172,6 +190,11 @@ public sealed class JobConsumerWorker : BackgroundService
         {
             Fail(lease.JobId, ex.Message);
             _log.LogError(ex, "job {JobId} ({Type}) failed", lease.JobId, lease.Type);
+        }
+        finally
+        {
+            _cancellations.Unregister(lease.JobId);
+            clientCancel.Dispose();
         }
     }
 

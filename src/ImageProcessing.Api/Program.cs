@@ -37,6 +37,7 @@ if (!Path.IsPathRooted(storageRoot))
 }
 
 builder.Services.AddSingleton<IJobStore, InMemoryJobStore>();
+builder.Services.AddSingleton<JobCancellationRegistry>();
 builder.Services.AddSingleton<IJobQueue>(_ => new ChannelJobQueue(processing.QueueCapacity));
 builder.Services.AddSingleton<IFileStorage>(_ => new TempFileStorage(storageRoot));
 builder.Services.AddSingleton(sp =>

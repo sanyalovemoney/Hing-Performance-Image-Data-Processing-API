@@ -34,10 +34,20 @@ public static class JobsEndpoints
             .ProducesProblem(StatusCodes.Status413PayloadTooLarge)
             .ProducesProblem(StatusCodes.Status503ServiceUnavailable);
 
+        jobs.MapGet("", ListJobs)
+            .WithName("ListJobs")
+            .Produces(StatusCodes.Status200OK)
+            .ProducesProblem(StatusCodes.Status400BadRequest);
+
         jobs.MapGet("/{id:guid}/status", (Guid id, IJobStore store) =>
                 store.Get(id) is { } job ? Results.Ok(ToDto(job)) : Results.NotFound())
             .WithName("GetJobStatus")
             .Produces<JobStatusDto>()
+            .ProducesProblem(StatusCodes.Status404NotFound);
+
+        jobs.MapDelete("/{id:guid}", DeleteJob)
+            .WithName("DeleteJob")
+            .Produces(StatusCodes.Status202Accepted)
             .ProducesProblem(StatusCodes.Status404NotFound);
 
         jobs.MapGet("/{id:guid}/result", GetResultAsync)
@@ -243,6 +253,81 @@ public static class JobsEndpoints
         }
 
         return Results.Accepted($"/api/v1/jobs/{id}/status", ToDto(record));
+    }
+
+    /// <summary>
+    /// Paginated job list, newest first: ?limit=50&amp;offset=0 (limit capped at 200).
+    /// </summary>
+    private static IResult ListJobs(IJobStore store, int? limit, int? offset)
+    {
+        var take = Math.Clamp(limit ?? 50, 1, 200);
+        var skip = Math.Max(offset ?? 0, 0);
+
+        var all = store.List();
+        var items = all
+            .OrderByDescending(j => j.CreatedAt)
+            .Skip(skip)
+            .Take(take)
+            .Select(ToDto)
+            .ToArray();
+
+        return Results.Ok(new { items, total = all.Count, limit = take, offset = skip });
+    }
+
+    /// <summary>
+    /// Cancel + cleanup: signals a Running job to stop cooperatively, marks a
+    /// Queued job Canceled (the consumer skips non-Queued leases), and removes
+    /// files + record for terminal jobs. Always 202 when the job is known.
+    /// </summary>
+    private static IResult DeleteJob(
+        Guid id, IJobStore store, IFileStorage storage, JobCancellationRegistry cancellations)
+    {
+        var job = store.Get(id);
+        if (job is null)
+        {
+            return Results.NotFound(new { error = "job not found" });
+        }
+
+        switch (job.Status)
+        {
+            case JobStatus.Running:
+                // Best effort: the job observes cancellation at its next await.
+                // If it just finished, TryCancel returns false — still 202,
+                // the terminal record gets cleaned up by a later DELETE or TTL.
+                cancellations.TryCancel(id);
+                return Results.Accepted(value: new { id, status = "canceling" });
+
+            case JobStatus.Queued:
+                store.Update(id, j =>
+                {
+                    if (j.Status == JobStatus.Queued)
+                    {
+                        j.Status = JobStatus.Canceled;
+                        j.Error = "canceled by client";
+                        j.FinishedAt = DateTimeOffset.UtcNow;
+                    }
+                });
+                if (job.UploadPath is not null)
+                {
+                    storage.Delete(job.UploadPath);
+                }
+
+                return Results.Accepted(value: ToDto(store.Get(id)!));
+
+            default: // terminal: drop files and the record
+                if (job.UploadPath is not null)
+                {
+                    storage.Delete(job.UploadPath);
+                }
+
+                if (job.ResultPath is not null)
+                {
+                    storage.Delete(job.ResultPath);
+                }
+
+                store.TryRemove(id);
+                return Results.Accepted(value: new { id, status = "removed" });
+        }
     }
 
     private static IResult QueueFull() => new QueueFullResult();
