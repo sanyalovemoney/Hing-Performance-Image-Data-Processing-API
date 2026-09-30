@@ -8,6 +8,7 @@ using ImageProcessing.Api.Endpoints;
 using ImageProcessing.Core.Jobs;
 using ImageProcessing.Core.Processing;
 using ImageProcessing.Core.Queue;
+using ImageProcessing.Core.Storage;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -413,6 +414,161 @@ public sealed class JobsEndpointsTests : IClassFixture<JobsApiFactory>
         var done = await PollUntilTerminalAsync(client, $"/api/v1/jobs/{created.Id}/status");
         Assert.Equal("Succeeded", done.Status);
         await PollUntilReadyAsync(client);
+    }
+
+    private sealed record JobListDto(JobStatusDto[] Items, int Total, int Limit, int Offset);
+
+    [Fact]
+    public async Task List_endpoint_paginates_jobs()
+    {
+        using var client = _factory.CreateClient();
+        for (var i = 0; i < 3; i++)
+        {
+            using var form = MakeForm();
+            var response = await client.PostAsync("/api/v1/jobs", form);
+            Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        }
+
+        var page = await client.GetFromJsonAsync<JobListDto>("/api/v1/jobs?limit=2&offset=0", JsonOpts);
+        Assert.NotNull(page);
+        Assert.True(page!.Total >= 3, $"expected at least the 3 jobs this test created, got {page.Total}");
+        Assert.Equal(2, page.Items.Length);
+        Assert.Equal(2, page.Limit);
+        Assert.Equal(0, page.Offset);
+
+        var second = await client.GetFromJsonAsync<JobListDto>("/api/v1/jobs?limit=2&offset=2", JsonOpts);
+        Assert.NotNull(second);
+        Assert.DoesNotContain(second!.Items, j => page.Items.Any(p => p.Id == j.Id));
+    }
+
+    [Fact]
+    public async Task Delete_unknown_job_returns_404()
+    {
+        using var client = _factory.CreateClient();
+
+        var response = await client.DeleteAsync($"/api/v1/jobs/{Guid.NewGuid()}");
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Delete_finished_job_removes_record_and_files()
+    {
+        using var client = _factory.CreateClient();
+        using var form = MakeForm();
+        var accepted = await client.PostAsync("/api/v1/jobs", form);
+        var created = await accepted.Content.ReadFromJsonAsync<JobStatusDto>(JsonOpts);
+        var done = await PollUntilTerminalAsync(client, $"/api/v1/jobs/{created!.Id}/status");
+        Assert.Equal("Succeeded", done.Status);
+
+        var deleted = await client.DeleteAsync($"/api/v1/jobs/{created.Id}");
+        Assert.Equal(HttpStatusCode.Accepted, deleted.StatusCode);
+
+        var after = await client.GetAsync($"/api/v1/jobs/{created.Id}/status");
+        Assert.Equal(HttpStatusCode.NotFound, after.StatusCode);
+
+        var storage = _factory.Services.GetRequiredService<IFileStorage>();
+        Assert.DoesNotContain(storage.List(), e =>
+            e.RelativePath.Contains(created.Id.ToString("N"), StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Delete_running_job_cancels_it_cooperatively()
+    {
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var factory = new JobsApiFactory();
+        using var gated = factory.WithWebHostBuilder(b =>
+        {
+            b.UseSetting("Processing:MaxConcurrency", "1");
+            b.ConfigureTestServices(services =>
+                services.AddSingleton(_ =>
+                    new ProcessorRegistry().Register(new GateProcessor("echo", gate))));
+        });
+        using var client = gated.CreateClient();
+
+        using var form = MakeForm();
+        var accepted = await client.PostAsync("/api/v1/jobs", form);
+        var created = await accepted.Content.ReadFromJsonAsync<JobStatusDto>(JsonOpts);
+        await PollUntilRunningAsync(client, created!.Id);
+
+        var deleted = await client.DeleteAsync($"/api/v1/jobs/{created.Id}");
+        Assert.Equal(HttpStatusCode.Accepted, deleted.StatusCode);
+
+        var dto = await PollUntilTerminalAsync(client, $"/api/v1/jobs/{created.Id}/status");
+        Assert.Equal("Canceled", dto.Status);
+        Assert.Contains("canceled by client", dto.Error, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Delete_queued_job_cancels_it_and_removes_upload()
+    {
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var factory = new JobsApiFactory();
+        using var gated = factory.WithWebHostBuilder(b =>
+        {
+            b.UseSetting("Processing:QueueCapacity", "8");
+            b.UseSetting("Processing:MaxConcurrency", "1");
+            b.ConfigureTestServices(services =>
+                services.AddSingleton(_ =>
+                    new ProcessorRegistry().Register(new GateProcessor("echo", gate))));
+        });
+        using var client = gated.CreateClient();
+
+        // Park the single worker slot so the second job provably stays Queued.
+        using var firstForm = MakeForm();
+        var first = await client.PostAsync("/api/v1/jobs", firstForm);
+        var firstDto = await first.Content.ReadFromJsonAsync<JobStatusDto>(JsonOpts);
+        await PollUntilRunningAsync(client, firstDto!.Id);
+
+        using var secondForm = MakeForm();
+        var second = await client.PostAsync("/api/v1/jobs", secondForm);
+        var secondDto = await second.Content.ReadFromJsonAsync<JobStatusDto>(JsonOpts);
+        var before = await client.GetFromJsonAsync<JobStatusDto>(
+            $"/api/v1/jobs/{secondDto!.Id}/status", JsonOpts);
+        Assert.Equal("Queued", before!.Status);
+
+        var deleted = await client.DeleteAsync($"/api/v1/jobs/{secondDto.Id}");
+        Assert.Equal(HttpStatusCode.Accepted, deleted.StatusCode);
+
+        var after = await client.GetFromJsonAsync<JobStatusDto>(
+            $"/api/v1/jobs/{secondDto.Id}/status", JsonOpts);
+        Assert.Equal("Canceled", after!.Status);
+
+        var storage = gated.Services.GetRequiredService<IFileStorage>();
+        Assert.DoesNotContain(storage.List(), e =>
+            e.RelativePath.Contains(secondDto.Id.ToString("N"), StringComparison.Ordinal));
+
+        // Unblock the worker: the canceled job's lease must be skipped, not run.
+        gate.SetResult();
+        var done = await PollUntilTerminalAsync(client, $"/api/v1/jobs/{firstDto.Id}/status");
+        Assert.Equal("Succeeded", done.Status);
+        var stillCanceled = await client.GetFromJsonAsync<JobStatusDto>(
+            $"/api/v1/jobs/{secondDto.Id}/status", JsonOpts);
+        Assert.Equal("Canceled", stillCanceled!.Status);
+    }
+
+    [Fact]
+    public async Task Burst_of_six_jobs_all_succeed_under_concurrency_limit()
+    {
+        using var client = _factory.CreateClient();
+
+        var posts = Enumerable.Range(0, 6).Select(async _ =>
+        {
+            using var form = MakeForm(
+                type: "csv", fileName: "data.csv", payload: BuildCsvPayload(), mediaType: "text/csv");
+            form.Add(new StringContent("""{"column":1,"aggregate":"sum"}"""), "params");
+            var response = await client.PostAsync("/api/v1/jobs", form);
+            Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+            return (await response.Content.ReadFromJsonAsync<JobStatusDto>(JsonOpts))!.Id;
+        });
+        var ids = await Task.WhenAll(posts);
+
+        Assert.Equal(6, ids.Distinct().Count());
+        foreach (var id in ids)
+        {
+            var dto = await PollUntilTerminalAsync(client, $"/api/v1/jobs/{id}/status");
+            Assert.Equal("Succeeded", dto.Status);
+        }
     }
 
     private static async Task<JobStatusDto> PollUntilTerminalAsync(HttpClient client, string statusUrl)

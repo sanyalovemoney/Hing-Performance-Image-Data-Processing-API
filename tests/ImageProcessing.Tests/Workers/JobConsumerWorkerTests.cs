@@ -30,7 +30,7 @@ public sealed class JobConsumerWorkerTests
         public Task ProcessAsync(JobRecord job, CancellationToken ct) => _run(job, ct);
     }
 
-    private static (JobConsumerWorker Worker, InMemoryJobStore Store, ChannelJobQueue Queue) Start(
+    private static (JobConsumerWorker Worker, InMemoryJobStore Store, ChannelJobQueue Queue, JobCancellationRegistry Cancellations) Start(
         Func<JobRecord, CancellationToken, Task> run,
         Action<ProcessingOptions>? configure = null)
     {
@@ -43,11 +43,13 @@ public sealed class JobConsumerWorkerTests
 
         var store = new InMemoryJobStore();
         var queue = new ChannelJobQueue(capacity: 16);
+        var cancellations = new JobCancellationRegistry();
         var registry = new ProcessorRegistry().Register(new DelegateProcessor("test", run));
         var worker = new JobConsumerWorker(
-            queue, store, registry, Options.Create(options), NullLogger<JobConsumerWorker>.Instance);
+            queue, store, registry, cancellations, Options.Create(options),
+            NullLogger<JobConsumerWorker>.Instance);
         worker.StartAsync(CancellationToken.None).GetAwaiter().GetResult();
-        return (worker, store, queue);
+        return (worker, store, queue, cancellations);
     }
 
     private static Guid[] Enqueue(InMemoryJobStore store, ChannelJobQueue queue, int count)
@@ -87,7 +89,7 @@ public sealed class JobConsumerWorkerTests
     {
         var current = 0;
         var peak = 0;
-        var (worker, store, queue) = Start(async (_, ct) =>
+        var (worker, store, queue, _) = Start(async (_, ct) =>
         {
             var n = Interlocked.Increment(ref current);
             int p;
@@ -123,7 +125,7 @@ public sealed class JobConsumerWorkerTests
     [Fact]
     public async Task Job_exceeding_timeout_fails_with_readable_error()
     {
-        var (worker, store, queue) = Start(
+        var (worker, store, queue, _) = Start(
             (_, ct) => Task.Delay(TimeSpan.FromSeconds(30), ct),
             o => o.JobTimeout = TimeSpan.FromMilliseconds(300));
 
@@ -146,7 +148,7 @@ public sealed class JobConsumerWorkerTests
     public async Task IOException_triggers_exactly_one_retry_then_succeeds()
     {
         var attempts = 0;
-        var (worker, store, queue) = Start((_, _) =>
+        var (worker, store, queue, _) = Start((_, _) =>
         {
             if (Interlocked.Increment(ref attempts) == 1)
             {
@@ -174,7 +176,7 @@ public sealed class JobConsumerWorkerTests
     public async Task Persistent_IOException_fails_after_second_attempt()
     {
         var attempts = 0;
-        var (worker, store, queue) = Start((_, _) =>
+        var (worker, store, queue, _) = Start((_, _) =>
         {
             Interlocked.Increment(ref attempts);
             throw new IOException("disk is gone");
@@ -200,7 +202,7 @@ public sealed class JobConsumerWorkerTests
     public async Task Non_IO_exception_fails_job_without_retry()
     {
         var attempts = 0;
-        var (worker, store, queue) = Start((_, _) =>
+        var (worker, store, queue, _) = Start((_, _) =>
         {
             Interlocked.Increment(ref attempts);
             throw new InvalidOperationException("boom");
@@ -226,7 +228,7 @@ public sealed class JobConsumerWorkerTests
     public async Task Lease_without_store_record_is_skipped_and_worker_keeps_running()
     {
         var processed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var (worker, store, queue) = Start((_, _) =>
+        var (worker, store, queue, _) = Start((_, _) =>
         {
             processed.SetResult();
             return Task.CompletedTask;
@@ -251,7 +253,7 @@ public sealed class JobConsumerWorkerTests
     public async Task StopAsync_drains_in_flight_job_instead_of_canceling_it()
     {
         var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var (worker, store, queue) = Start(async (_, _) =>
+        var (worker, store, queue, _) = Start(async (_, _) =>
         {
             started.SetResult();
             // Ignores every token: only a graceful drain can let this finish.
@@ -264,5 +266,52 @@ public sealed class JobConsumerWorkerTests
         await worker.StopAsync(CancellationToken.None);
 
         Assert.Equal(JobStatus.Succeeded, store.Get(ids[0])!.Status);
+    }
+
+    [Fact]
+    public async Task Client_cancellation_marks_running_job_Canceled()
+    {
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var (worker, store, queue, cancellations) = Start(async (_, ct) =>
+        {
+            started.SetResult();
+            await Task.Delay(TimeSpan.FromSeconds(30), ct); // observes cancellation
+        });
+
+        try
+        {
+            var ids = Enqueue(store, queue, 1);
+            await started.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+            Assert.True(cancellations.TryCancel(ids[0]));
+            await WaitForTerminalAsync(store, ids);
+
+            var job = store.Get(ids[0])!;
+            Assert.Equal(JobStatus.Canceled, job.Status);
+            Assert.Contains("canceled by client", job.Error, StringComparison.Ordinal);
+        }
+        finally
+        {
+            await worker.StopAsync(CancellationToken.None);
+        }
+    }
+
+    [Fact]
+    public async Task Cancellation_registry_is_cleaned_up_after_job_finishes()
+    {
+        var (worker, store, queue, cancellations) = Start((_, _) => Task.CompletedTask);
+
+        try
+        {
+            var ids = Enqueue(store, queue, 1);
+            await WaitForTerminalAsync(store, ids);
+
+            // Job finished → no CTS left behind; cancel is a no-op returning false.
+            Assert.False(cancellations.TryCancel(ids[0]));
+        }
+        finally
+        {
+            await worker.StopAsync(CancellationToken.None);
+        }
     }
 }
