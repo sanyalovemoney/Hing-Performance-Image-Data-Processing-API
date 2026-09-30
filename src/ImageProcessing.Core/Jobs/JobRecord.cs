@@ -3,7 +3,7 @@ namespace ImageProcessing.Core.Jobs;
 /// <summary>
 /// Mutable job state. Writers mutate a record only while holding the record's
 /// monitor inside <see cref="IJobStore.Update"/>; readers get an immutable
-/// snapshot via <see cref="IJobStore.Get"/> / <see cref="Clone"/>.
+/// snapshot via <see cref="IJobStore.Get"/> / <see cref="Snapshot"/>.
 /// </summary>
 public sealed record JobRecord
 {
