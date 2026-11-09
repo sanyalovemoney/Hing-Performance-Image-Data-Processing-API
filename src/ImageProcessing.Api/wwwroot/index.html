@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="uk" class="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Image/Data Processing API</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = { darkMode: 'class' };
+  </script>
+  <style>
+    .dropzone.drag { border-color: #3b82f6; background: rgba(59,130,246,.08); }
+    .toast { animation: slide .25s ease; }
+    @keyframes slide { from { transform: translateY(-10px); opacity: 0; } to { transform: none; opacity: 1; } }
+  </style>
+</head>
+<body class="min-h-screen bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100">
+  <header class="sticky top-0 z-10 backdrop-blur bg-white/70 dark:bg-slate-900/70 border-b border-slate-200 dark:border-slate-800">
+    <div class="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between">
+      <div class="flex items-center gap-3">
+        <div class="w-9 h-9 rounded-xl bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center text-white font-bold">IP</div>
+        <div>
+          <div class="font-semibold leading-tight">Image/Data Processing API</div>
+          <div class="text-xs text-slate-500 dark:text-slate-400">Span · ArrayPool · Channel · SIMD</div>
+        </div>
+      </div>
+      <div class="flex items-center gap-2">
+        <span id="healthBadge" class="px-3 py-1 rounded-full text-xs font-semibold bg-slate-200 dark:bg-slate-800">health: …</span>
+        <span id="readyBadge" class="px-3 py-1 rounded-full text-xs font-semibold bg-slate-200 dark:bg-slate-800">ready: …</span>
+        <button id="themeBtn" class="px-3 py-1 rounded-lg bg-slate-200 dark:bg-slate-800 text-xs">🌙</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="max-w-6xl mx-auto px-4 py-6 grid grid-cols-1 lg:grid-cols-3 gap-6">
+    <!-- Upload -->
+    <section class="lg:col-span-1 space-y-4">
+      <div class="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-5 shadow-sm">
+        <h2 class="font-semibold mb-3">Нове завдання</h2>
+
+        <div id="dropzone" class="dropzone border-2 border-dashed border-slate-300 dark:border-slate-700 rounded-xl p-6 text-center cursor-pointer transition">
+          <input type="file" id="file" class="hidden" />
+          <div id="dropText" class="text-sm text-slate-500 dark:text-slate-400">
+            Перетягніть файл сюди або <span class="text-blue-500">оберіть</span>
+          </div>
+          <img id="preview" class="mt-3 mx-auto max-h-40 rounded-lg hidden" alt="preview" />
+        </div>
+
+        <div class="mt-4 space-y-3">
+          <div>
+            <label class="text-xs font-medium text-slate-600 dark:text-slate-300">Тип обробки</label>
+            <select id="type" class="w-full mt-1 px-3 py-2 rounded-lg bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700">
+              <option value="image">image</option>
+              <option value="csv">csv</option>
+              <option value="matrix">matrix</option>
+              <option value="echo">echo</option>
+            </select>
+          </div>
+          <div>
+            <label class="text-xs font-medium text-slate-600 dark:text-slate-300">Параметри (JSON)</label>
+            <textarea id="params" rows="3" placeholder='{"filter":"grayscale"}'
+              class="w-full mt-1 px-3 py-2 rounded-lg bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 font-mono text-sm"></textarea>
+            <div class="mt-1 flex flex-wrap gap-1">
+              <button data-preset='{"filter":"grayscale"}' class="preset text-xs px-2 py-1 rounded bg-slate-100 dark:bg-slate-800">grayscale</button>
+              <button data-preset='{"filter":"blur"}' class="preset text-xs px-2 py-1 rounded bg-slate-100 dark:bg-slate-800">blur</button>
+              <button data-preset='{"filter":"threshold","thresholdLevel":128}' class="preset text-xs px-2 py-1 rounded bg-slate-100 dark:bg-slate-800">threshold</button>
+              <button data-preset='{"filter":"resize","maxDimension":512}' class="preset text-xs px-2 py-1 rounded bg-slate-100 dark:bg-slate-800">resize</button>
+            </div>
+          </div>
+          <button id="submitBtn" class="w-full py-2.5 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-semibold transition">
+            Завантажити і запустити
+          </button>
+          <div id="uploadError" class="text-sm text-red-500"></div>
+          <div id="uploadInfo" class="text-xs text-slate-500 dark:text-slate-400"></div>
+        </div>
+      </div>
+
+      <div class="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-5 shadow-sm">
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="font-semibold">Історія завдань</h2>
+          <button id="listBtn" class="text-xs px-3 py-1 rounded bg-slate-100 dark:bg-slate-800">Оновити</button>
+        </div>
+        <div id="jobList" class="space-y-2 max-h-80 overflow-auto text-sm"></div>
+      </div>
+    </section>
+
+    <!-- Job detail -->
+    <section class="lg:col-span-2 space-y-4">
+      <div id="jobCard" class="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-5 shadow-sm hidden">
+        <div class="flex items-start justify-between gap-3">
+          <div>
+            <div class="text-xs text-slate-500 dark:text-slate-400">Job ID</div>
+            <div id="jobId" class="font-mono text-sm break-all"></div>
+          </div>
+          <span id="jobStatus" class="px-3 py-1 rounded-full text-xs font-semibold bg-slate-200 dark:bg-slate-800">…</span>
+        </div>
+
+        <div class="mt-3">
+          <div class="h-2 rounded-full bg-slate-200 dark:bg-slate-800 overflow-hidden">
+            <div id="progressBar" class="h-full bg-blue-500 transition-all" style="width:0%"></div>
+          </div>
+          <div id="jobMeta" class="mt-2 text-xs text-slate-500 dark:text-slate-400"></div>
+        </div>
+
+        <div class="mt-4 flex flex-wrap gap-2">
+          <button id="downloadBtn" disabled class="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-semibold disabled:opacity-40 disabled:cursor-not-allowed">⬇ Завантажити результат</button>
+          <button id="rowsBtn" disabled class="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold disabled:opacity-40 disabled:cursor-not-allowed">≡ Показати рядки</button>
+          <button id="deleteBtn" class="px-4 py-2 rounded-xl bg-red-600 hover:bg-red-700 text-white text-sm font-semibold">🗑 Видалити</button>
+        </div>
+
+        <div id="resultPreview" class="mt-4 hidden">
+          <div class="text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">Результат</div>
+          <img id="resultImg" class="max-h-72 rounded-xl border border-slate-200 dark:border-slate-700" alt="result" />
+        </div>
+
+        <details class="mt-4">
+          <summary class="cursor-pointer text-sm text-slate-500 dark:text-slate-400">JSON відповідь</summary>
+          <pre id="jobJson" class="mt-2 text-xs"></pre>
+        </details>
+
+        <div id="rowsWrap" class="mt-4 hidden">
+          <div class="text-xs font-medium text-slate-600 dark:text-slate-300 mb-1">NDJSON (перші рядки)</div>
+          <pre id="rowsOut" class="text-xs max-h-64 overflow-auto"></pre>
+        </div>
+      </div>
+
+      <div id="emptyState" class="rounded-2xl border-2 border-dashed border-slate-200 dark:border-slate-800 p-10 text-center text-slate-400">
+        Завантажте файл, щоб побачити стан завдання
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="fixed top-4 right-4 z-50 hidden"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

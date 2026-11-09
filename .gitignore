@@ -483,6 +483,6 @@ $RECYCLE.BIN/
 # Vim temporary swap files
 *.swp
 
-# runtime job storage
-storage/
+# runtime job storage (root only; source folders like src/.../Storage must stay tracked)
+/storage/
 *.user

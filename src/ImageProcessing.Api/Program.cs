@@ -54,6 +54,10 @@ builder.Services.AddJobWorkers();
 
 var app = builder.Build();
 
+// Static frontend (wwwroot).
+app.UseDefaultFiles();
+app.UseStaticFiles();
+
 // Liveness probe — always OK once the process is up.
 app.MapGet("/healthz", () => Results.Ok(new { status = "ok" }));
 
