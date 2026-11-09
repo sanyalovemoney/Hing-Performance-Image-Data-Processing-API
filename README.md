@@ -161,5 +161,4 @@ CI (GitHub Actions): build + test on push/PR; benchmarks weekly and on
 ## Architecture
 
 See [`docs/architecture.md`](docs/architecture.md) for the request lifecycle,
-backpressure valves, reliability model and zero-allocation strategy. The original
-project spec is in [`workflow.md`](workflow.md).
+backpressure valves, reliability model and zero-allocation strategy. 
